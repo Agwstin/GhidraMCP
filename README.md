@@ -1,20 +1,56 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/LaurieWired/GhidraMCP)](https://github.com/LaurieWired/GhidraMCP/releases)
-[![GitHub stars](https://img.shields.io/github/stars/LaurieWired/GhidraMCP)](https://github.com/LaurieWired/GhidraMCP/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/LaurieWired/GhidraMCP)](https://github.com/LaurieWired/GhidraMCP/network/members)
-[![GitHub contributors](https://img.shields.io/github/contributors/LaurieWired/GhidraMCP)](https://github.com/LaurieWired/GhidraMCP/graphs/contributors)
-[![Follow @lauriewired](https://img.shields.io/twitter/follow/lauriewired?style=social)](https://twitter.com/lauriewired)
 
 ![ghidra_MCP_logo](https://github.com/user-attachments/assets/4986d702-be3f-4697-acce-aea55cd79ad3)
 
+# GhidraMCP v2 (Fork)
 
-# ghidraMCP
-ghidraMCP is an Model Context Protocol server for allowing LLMs to autonomously reverse engineer applications. It exposes numerous tools from core Ghidra functionality to MCP clients.
+> Fork of [LaurieWired/GhidraMCP](https://github.com/LaurieWired/GhidraMCP) with multi-program support, JSON API, new analysis endpoints, and performance improvements.
 
-https://github.com/user-attachments/assets/36080514-f227-44bd-af84-78e29ee1d7f9
+GhidraMCP is a Model Context Protocol server for allowing LLMs to autonomously reverse engineer applications. It exposes numerous tools from core Ghidra functionality to MCP clients.
 
+## What's new in this fork
 
-# Features
+### Multi-program & multi-instance
+- **Multiple binaries at once** — all endpoints accept `?program=name` to target any open program in the CodeBrowser
+- **Multiple CodeBrowsers** — the Python bridge accepts multiple `--ghidra-server` URLs to connect to parallel Ghidra instances
+- **Auto-port detection** — if port 8080 is busy, the plugin tries 8081-8090 automatically
+- `list_servers`, `list_all_programs` tools to see everything at a glance
+
+### New endpoints
+| Endpoint | Description |
+|---|---|
+| `/health` | Server status, bound port, active program |
+| `/programs` | All open programs with name, path, language |
+| `/read_memory` | Raw hex bytes from any address |
+| `/list_structs` | All structures with field details |
+| `/list_enums` | All enums with values |
+| `/get_callgraph` | Recursive callers/callees (configurable depth, cycle-safe) |
+| `/batch_decompile` | Decompile multiple functions in one request |
+| `/undo` | Revert the last transaction |
+
+### Performance
+- **O(1) function lookup** via SymbolTable instead of linear iteration
+- **4-thread pool** on HTTP server (was single-threaded)
+- **DecompInterface leak fixed** — always disposed in try-finally
+- **Timeouts**: 60s decompile, 120s batch (was 5s — large functions would always fail)
+
+### JSON API
+All responses are now structured JSON:
+```json
+{"status": "ok", "data": [{"name": "main", "address": "0x401000"}]}
+```
+
+### Bugfixes
+- `endTransaction` void return compilation error
+- `list_functions` now has pagination
+- `renameData` reports actual success/failure
+- Valid JSON unicode escapes (`\u00xx` instead of `\x00`)
+- `searchFunctions` returns empty array instead of error on no results
+- `batch_decompile` JSON parser handles commas inside quoted strings
+
+---
+
+# Original Features
 MCP Server + Ghidra Plugin
 
 - Decompile and analyze binaries in Ghidra
@@ -74,6 +110,23 @@ Alternatively, edit this file directly:
 ```
 
 The server IP and port are configurable and should be set to point to the target Ghidra instance. If not set, both will default to localhost:8080.
+
+For **multiple Ghidra instances** running in parallel:
+```json
+{
+  "mcpServers": {
+    "ghidra": {
+      "command": "python",
+      "args": [
+        "/ABSOLUTE_PATH_TO/bridge_mcp_ghidra.py",
+        "--ghidra-server",
+        "http://127.0.0.1:8080/",
+        "http://127.0.0.1:8081/"
+      ]
+    }
+  }
+}
+```
 
 ## Example 2: Cline
 To use GhidraMCP with [Cline](https://cline.bot), this requires manually running the MCP server as well. First run the following command:
