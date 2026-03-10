@@ -55,13 +55,17 @@ import javax.swing.SwingUtilities;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * GhidraMCPPlugin exposes Ghidra program analysis over HTTP so that LLMs and
@@ -94,6 +98,12 @@ public class GhidraMCPPlugin extends Plugin {
     private static final int    DEFAULT_PORT         = 8080;
     private static final int    PORT_SEARCH_RANGE    = 10;
     private static final int    MAX_READ_MEMORY_BYTES = 4096;
+
+    // ── FORK: Async decompilation ───────────────────────────────────────────
+    private final ConcurrentHashMap<String, AsyncTask> asyncTasks = new ConcurrentHashMap<>();
+    private final AtomicLong taskCounter = new AtomicLong(0);
+    private final ExecutorService asyncExecutor = Executors.newFixedThreadPool(2);
+    // ── END FORK ────────────────────────────────────────────────────────────
 
     // -----------------------------------------------------------------------
     // Constructor
@@ -146,7 +156,7 @@ public class GhidraMCPPlugin extends Plugin {
         for (int attempt = 0; attempt < PORT_SEARCH_RANGE; attempt++) {
             int port = basePort + attempt;
             try {
-                server = HttpServer.create(new InetSocketAddress(port), 0);
+                server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0);
                 actualPort = port;
                 break;
             } catch (IOException e) {
@@ -411,6 +421,132 @@ public class GhidraMCPPlugin extends Plugin {
             Map<String, String> qparams = parseQueryParams(exchange);
             sendJsonResponse(exchange, undoLastAction(qparams));
         });
+
+        // ── FORK: Struct/Enum CRUD endpoints ────────────────────────────────
+
+        server.createContext("/create_struct", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, createStruct(qparams, params.get("name"),
+                parseIntOrDefault(params.get("size"), 0)));
+        });
+
+        server.createContext("/delete_struct", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, deleteStruct(qparams, params.get("name")));
+        });
+
+        server.createContext("/get_struct", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, getStruct(qparams, qparams.get("name")));
+        });
+
+        server.createContext("/add_struct_field", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, addStructField(qparams, params.get("struct_name"),
+                parseIntOrDefault(params.get("offset"), -1),
+                params.get("field_type"), params.get("field_name"),
+                parseIntOrDefault(params.get("field_size"), -1)));
+        });
+
+        server.createContext("/create_enum", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, createEnum(qparams, params.get("name"),
+                parseIntOrDefault(params.get("size"), 4)));
+        });
+
+        server.createContext("/add_enum_value", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, addEnumValue(qparams, params.get("enum_name"),
+                params.get("entry_name"),
+                Long.parseLong(params.getOrDefault("value", "0"))));
+        });
+
+        server.createContext("/delete_enum", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, deleteEnum(qparams, params.get("name")));
+        });
+
+        server.createContext("/apply_struct_at_address", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, applyStructAtAddress(qparams,
+                params.get("struct_name"), params.get("address")));
+        });
+
+        server.createContext("/list_types", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"), 100);
+            sendJsonResponse(exchange, listTypes(qparams, offset, limit, qparams.get("category")));
+        });
+
+        // ── END FORK: Struct/Enum CRUD ──────────────────────────────────────
+
+        // ── FORK: Async decompilation endpoints ─────────────────────────────
+
+        server.createContext("/decompile_async", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, decompileAsync(qparams, params.get("address")));
+        });
+
+        server.createContext("/task_status", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, getTaskStatus(qparams.get("task_id")));
+        });
+
+        server.createContext("/task_result", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, getTaskResult(qparams.get("task_id")));
+        });
+
+        // ── END FORK: Async decompilation ───────────────────────────────────
+
+        // ── FORK: Utility endpoints ─────────────────────────────────────────
+
+        server.createContext("/save", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, saveProgram(qparams));
+        });
+
+        server.createContext("/goto", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, goToAddress(qparams, params.get("address")));
+        });
+
+        server.createContext("/create_function", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, createFunction(qparams, params.get("address")));
+        });
+
+        server.createContext("/search_bytes", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int maxResults = parseIntOrDefault(qparams.get("max_results"), 10);
+            sendJsonResponse(exchange, searchBytes(qparams, qparams.get("pattern"), maxResults));
+        });
+
+        server.createContext("/write_memory", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, writeMemory(qparams, params.get("address"), params.get("bytes")));
+        });
+
+        server.createContext("/set_calling_convention", exchange -> {
+            Map<String, String> params  = parsePostParams(exchange);
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendJsonResponse(exchange, setCallingConvention(qparams,
+                params.get("function_address"), params.get("convention")));
+        });
+
+        // ── END FORK: Utility endpoints ─────────────────────────────────────
 
         // ---- Start the server ----------------------------------------------
         server.setExecutor(Executors.newFixedThreadPool(4));
@@ -1097,6 +1233,14 @@ public class GhidraMCPPlugin extends Plugin {
     private boolean setDisassemblyComment(Map<String, String> qparams, String addressStr, String comment) {
         return setCommentAtAddress(qparams, addressStr, comment, CodeUnit.EOL_COMMENT, "Set disassembly comment");
     }
+
+    // ── FORK: Async decompilation task ──────────────────────────────────────
+    private static class AsyncTask {
+        volatile String status = "pending"; // pending, running, completed, failed
+        volatile String result = null;
+        volatile String error = null;
+    }
+    // ── END FORK ────────────────────────────────────────────────────────────
 
     // -----------------------------------------------------------------------
     // PrototypeResult inner class (preserved exactly)
@@ -2028,12 +2172,558 @@ public class GhidraMCPPlugin extends Plugin {
         }
     }
 
+    // ── FORK: Struct/Enum CRUD methods ──────────────────────────────────────
+
+    private String createStruct(Map<String, String> qparams, String name, int size) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (name == null || name.isEmpty()) return jsonError("Struct name is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create struct");
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    ghidra.program.model.data.StructureDataType struct =
+                        new ghidra.program.model.data.StructureDataType(
+                            new ghidra.program.model.data.CategoryPath("/"), name, Math.max(size, 0), dtm);
+                    dtm.addDataType(struct, ghidra.program.model.data.DataTypeConflictHandler.REPLACE_HANDLER);
+                    success.set(true);
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating struct", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Struct '" + name + "' created"))
+                             : jsonError("Failed to create struct");
+    }
+
+    private String deleteStruct(Map<String, String> qparams, String name) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (name == null || name.isEmpty()) return jsonError("Struct name is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Delete struct");
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dt = findDataTypeByNameInAllCategories(dtm, name);
+                    if (dt instanceof Structure) {
+                        dtm.remove(dt, new ConsoleTaskMonitor());
+                        success.set(true);
+                    }
+                } catch (Exception e) {
+                    Msg.error(this, "Error deleting struct", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Struct '" + name + "' deleted"))
+                             : jsonError("Struct not found or delete failed");
+    }
+
+    private String getStruct(Map<String, String> qparams, String name) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (name == null || name.isEmpty()) return jsonError("Struct name is required");
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        DataType dt = findDataTypeByNameInAllCategories(dtm, name);
+        if (!(dt instanceof Structure)) return jsonError("Struct not found: " + name);
+
+        Structure struct = (Structure) dt;
+        StringBuilder fields = new StringBuilder("[");
+        boolean first = true;
+        for (DataTypeComponent comp : struct.getComponents()) {
+            if (!first) fields.append(",");
+            first = false;
+            fields.append("{");
+            fields.append("\"name\":").append(jsonString(comp.getFieldName() != null
+                ? comp.getFieldName() : "field_" + comp.getOffset())).append(",");
+            fields.append("\"type\":").append(jsonString(comp.getDataType().getName())).append(",");
+            fields.append("\"offset\":").append(comp.getOffset()).append(",");
+            fields.append("\"size\":").append(comp.getLength());
+            fields.append("}");
+        }
+        fields.append("]");
+
+        StringBuilder obj = new StringBuilder("{");
+        obj.append("\"name\":").append(jsonString(struct.getName())).append(",");
+        obj.append("\"path\":").append(jsonString(struct.getPathName())).append(",");
+        obj.append("\"size\":").append(struct.getLength()).append(",");
+        obj.append("\"numComponents\":").append(struct.getNumComponents()).append(",");
+        obj.append("\"fields\":").append(fields);
+        obj.append("}");
+        return jsonOk(obj.toString());
+    }
+
+    private String addStructField(Map<String, String> qparams, String structName,
+                                   int offset, String fieldType, String fieldName, int fieldSize) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (structName == null || structName.isEmpty()) return jsonError("struct_name is required");
+        if (fieldType == null || fieldType.isEmpty()) return jsonError("field_type is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Add struct field");
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dt = findDataTypeByNameInAllCategories(dtm, structName);
+                    if (!(dt instanceof Structure)) return;
+                    Structure struct = (Structure) dt;
+
+                    DataType fType = resolveDataType(dtm, fieldType);
+                    if (fType == null) return;
+
+                    if (offset >= 0) {
+                        int size = fieldSize > 0 ? fieldSize : fType.getLength();
+                        struct.replaceAtOffset(offset, fType, size,
+                            fieldName != null ? fieldName : "field_" + offset, null);
+                    } else {
+                        struct.add(fType, fieldSize > 0 ? fieldSize : fType.getLength(),
+                            fieldName != null ? fieldName : "field_" + struct.getLength(), null);
+                    }
+                    success.set(true);
+                } catch (Exception e) {
+                    Msg.error(this, "Error adding struct field", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Field added to struct '" + structName + "'"))
+                             : jsonError("Failed to add field");
+    }
+
+    private String createEnum(Map<String, String> qparams, String name, int size) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (name == null || name.isEmpty()) return jsonError("Enum name is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create enum");
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    ghidra.program.model.data.EnumDataType enumDt =
+                        new ghidra.program.model.data.EnumDataType(
+                            new ghidra.program.model.data.CategoryPath("/"), name, Math.max(size, 1));
+                    dtm.addDataType(enumDt, ghidra.program.model.data.DataTypeConflictHandler.REPLACE_HANDLER);
+                    success.set(true);
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating enum", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Enum '" + name + "' created"))
+                             : jsonError("Failed to create enum");
+    }
+
+    private String addEnumValue(Map<String, String> qparams, String enumName,
+                                 String entryName, long value) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (enumName == null || enumName.isEmpty()) return jsonError("enum_name is required");
+        if (entryName == null || entryName.isEmpty()) return jsonError("entry_name is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Add enum value");
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dt = findDataTypeByNameInAllCategories(dtm, enumName);
+                    if (dt instanceof ghidra.program.model.data.Enum) {
+                        ((ghidra.program.model.data.Enum) dt).add(entryName, value);
+                        success.set(true);
+                    }
+                } catch (Exception e) {
+                    Msg.error(this, "Error adding enum value", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Value '" + entryName + "' added to enum '" + enumName + "'"))
+                             : jsonError("Enum not found or add failed");
+    }
+
+    private String deleteEnum(Map<String, String> qparams, String name) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (name == null || name.isEmpty()) return jsonError("Enum name is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Delete enum");
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dt = findDataTypeByNameInAllCategories(dtm, name);
+                    if (dt instanceof ghidra.program.model.data.Enum) {
+                        dtm.remove(dt, new ConsoleTaskMonitor());
+                        success.set(true);
+                    }
+                } catch (Exception e) {
+                    Msg.error(this, "Error deleting enum", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Enum '" + name + "' deleted"))
+                             : jsonError("Enum not found or delete failed");
+    }
+
+    private String applyStructAtAddress(Map<String, String> qparams,
+                                         String structName, String addressStr) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (structName == null || structName.isEmpty()) return jsonError("struct_name is required");
+        if (addressStr == null || addressStr.isEmpty()) return jsonError("address is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Apply struct at address");
+                try {
+                    DataTypeManager dtm = program.getDataTypeManager();
+                    DataType dt = findDataTypeByNameInAllCategories(dtm, structName);
+                    if (!(dt instanceof Structure)) return;
+
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    ghidra.program.model.data.DataUtilities.createData(program, addr, dt,
+                        dt.getLength(), ghidra.program.model.data.DataUtilities.ClearDataMode.CLEAR_ALL_CONFLICT_DATA);
+                    success.set(true);
+                } catch (Exception e) {
+                    Msg.error(this, "Error applying struct", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Struct '" + structName + "' applied at " + addressStr))
+                             : jsonError("Failed to apply struct");
+    }
+
+    private String listTypes(Map<String, String> qparams, int offset, int limit, String category) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+
+        DataTypeManager dtm = program.getDataTypeManager();
+        List<String> items = new ArrayList<>();
+
+        Iterator<DataType> it = dtm.getAllDataTypes();
+        while (it.hasNext()) {
+            DataType dt = it.next();
+            if (category != null && !category.isEmpty()) {
+                if (!dt.getCategoryPath().toString().toLowerCase().contains(category.toLowerCase())) continue;
+            }
+            StringBuilder obj = new StringBuilder("{");
+            obj.append("\"name\":").append(jsonString(dt.getName())).append(",");
+            obj.append("\"path\":").append(jsonString(dt.getPathName())).append(",");
+            obj.append("\"size\":").append(dt.getLength()).append(",");
+            obj.append("\"kind\":").append(jsonString(dt.getClass().getSimpleName()));
+            obj.append("}");
+            items.add(obj.toString());
+        }
+        return jsonOk(paginateJsonArray(items, offset, limit));
+    }
+
+    // ── END FORK: Struct/Enum CRUD ──────────────────────────────────────────
+
+    // ── FORK: Async decompilation methods ───────────────────────────────────
+
+    private String decompileAsync(Map<String, String> qparams, String addressStr) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (addressStr == null || addressStr.isEmpty()) return jsonError("address is required");
+
+        String taskId = "task_" + taskCounter.incrementAndGet();
+        AsyncTask task = new AsyncTask();
+        task.status = "pending";
+        asyncTasks.put(taskId, task);
+
+        // Resolve function on the calling thread (Ghidra API is not thread-safe)
+        Address addr;
+        Function func;
+        try {
+            addr = program.getAddressFactory().getAddress(addressStr);
+            func = getFunctionForAddress(program, addr);
+        } catch (Exception e) {
+            asyncTasks.remove(taskId);
+            return jsonError("Invalid address: " + addressStr);
+        }
+        if (func == null) {
+            asyncTasks.remove(taskId);
+            return jsonError("No function at address: " + addressStr);
+        }
+
+        final Function finalFunc = func;
+        asyncExecutor.submit(() -> {
+            task.status = "running";
+            DecompInterface decomp = new DecompInterface();
+            try {
+                decomp.openProgram(program);
+                DecompileResults result = decomp.decompileFunction(finalFunc, 120, new ConsoleTaskMonitor());
+                if (result != null && result.decompileCompleted()) {
+                    task.result = result.getDecompiledFunction().getC();
+                    task.status = "completed";
+                } else {
+                    task.error = "Decompilation failed";
+                    task.status = "failed";
+                }
+            } catch (Exception e) {
+                task.error = e.getMessage();
+                task.status = "failed";
+            } finally {
+                decomp.dispose();
+            }
+        });
+
+        return jsonOk("{\"task_id\":" + jsonString(taskId) + "}");
+    }
+
+    private String getTaskStatus(String taskId) {
+        if (taskId == null || taskId.isEmpty()) return jsonError("task_id is required");
+        AsyncTask task = asyncTasks.get(taskId);
+        if (task == null) return jsonError("Task not found: " + taskId);
+
+        StringBuilder obj = new StringBuilder("{");
+        obj.append("\"task_id\":").append(jsonString(taskId)).append(",");
+        obj.append("\"status\":").append(jsonString(task.status));
+        if (task.error != null) {
+            obj.append(",\"error\":").append(jsonString(task.error));
+        }
+        obj.append("}");
+        return jsonOk(obj.toString());
+    }
+
+    private String getTaskResult(String taskId) {
+        if (taskId == null || taskId.isEmpty()) return jsonError("task_id is required");
+        AsyncTask task = asyncTasks.remove(taskId);
+        if (task == null) return jsonError("Task not found: " + taskId);
+
+        if (!"completed".equals(task.status)) {
+            asyncTasks.put(taskId, task); // put it back
+            return jsonError("Task not completed yet, status: " + task.status);
+        }
+        return jsonOk(jsonString(task.result));
+    }
+
+    // ── END FORK: Async decompilation ───────────────────────────────────────
+
+    // ── FORK: Utility methods ───────────────────────────────────────────────
+
+    private String saveProgram(Map<String, String> qparams) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+
+        try {
+            program.getDomainFile().save(new ConsoleTaskMonitor());
+            return jsonOk(jsonString("Program saved: " + program.getName()));
+        } catch (Exception e) {
+            return jsonError("Save failed: " + e.getMessage());
+        }
+    }
+
+    private String goToAddress(Map<String, String> qparams, String addressStr) {
+        if (addressStr == null || addressStr.isEmpty()) return jsonError("address is required");
+
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            ghidra.app.services.GoToService goToService = tool.getService(ghidra.app.services.GoToService.class);
+            if (goToService == null) return jsonError("GoTo service not available");
+
+            AtomicBoolean success = new AtomicBoolean(false);
+            SwingUtilities.invokeAndWait(() -> {
+                success.set(goToService.goTo(addr));
+            });
+            return success.get() ? jsonOk(jsonString("Navigated to " + addressStr))
+                                 : jsonError("Failed to navigate to " + addressStr);
+        } catch (Exception e) {
+            return jsonError("GoTo failed: " + e.getMessage());
+        }
+    }
+
+    private String createFunction(Map<String, String> qparams, String addressStr) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (addressStr == null || addressStr.isEmpty()) return jsonError("address is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Create function");
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    ghidra.app.cmd.function.CreateFunctionCmd cmd =
+                        new ghidra.app.cmd.function.CreateFunctionCmd(addr);
+                    success.set(cmd.applyTo(program, new ConsoleTaskMonitor()));
+                } catch (Exception e) {
+                    Msg.error(this, "Error creating function", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Function created at " + addressStr))
+                             : jsonError("Failed to create function at " + addressStr);
+    }
+
+    private String searchBytes(Map<String, String> qparams, String pattern, int maxResults) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (pattern == null || pattern.isEmpty()) return jsonError("pattern is required (hex string, e.g. '4889e5')");
+
+        try {
+            // Convert hex string to byte array
+            String hex = pattern.replaceAll("\\s+", "");
+            byte[] searchBytes = new byte[hex.length() / 2];
+            byte[] mask = new byte[searchBytes.length];
+            for (int i = 0; i < searchBytes.length; i++) {
+                String byteStr = hex.substring(i * 2, i * 2 + 2);
+                if (byteStr.equals("??")) {
+                    searchBytes[i] = 0;
+                    mask[i] = 0;
+                } else {
+                    searchBytes[i] = (byte) Integer.parseInt(byteStr, 16);
+                    mask[i] = (byte) 0xFF;
+                }
+            }
+
+            Memory mem = program.getMemory();
+            List<String> results = new ArrayList<>();
+            Address start = program.getMinAddress();
+            int found = 0;
+
+            while (start != null && found < maxResults) {
+                Address addr = mem.findBytes(start, searchBytes, mask, true, new ConsoleTaskMonitor());
+                if (addr == null) break;
+
+                Function func = program.getFunctionManager().getFunctionContaining(addr);
+                StringBuilder obj = new StringBuilder("{");
+                obj.append("\"address\":").append(jsonString(addr.toString()));
+                if (func != null) {
+                    obj.append(",\"function\":").append(jsonString(func.getName()));
+                }
+                obj.append("}");
+                results.add(obj.toString());
+
+                start = addr.add(1);
+                found++;
+            }
+            return jsonOk(jsonArray(results));
+        } catch (Exception e) {
+            return jsonError("Search failed: " + e.getMessage());
+        }
+    }
+
+    private String writeMemory(Map<String, String> qparams, String addressStr, String hexBytes) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (addressStr == null || addressStr.isEmpty()) return jsonError("address is required");
+        if (hexBytes == null || hexBytes.isEmpty()) return jsonError("bytes is required (hex string)");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Write memory");
+                try {
+                    Address addr = program.getAddressFactory().getAddress(addressStr);
+                    String hex = hexBytes.replaceAll("\\s+", "");
+                    byte[] bytes = new byte[hex.length() / 2];
+                    for (int i = 0; i < bytes.length; i++) {
+                        bytes[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+                    }
+                    program.getMemory().setBytes(addr, bytes);
+                    success.set(true);
+                } catch (Exception e) {
+                    Msg.error(this, "Error writing memory", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Wrote " + (hexBytes.replaceAll("\\s+", "").length() / 2) + " bytes at " + addressStr))
+                             : jsonError("Failed to write memory");
+    }
+
+    private String setCallingConvention(Map<String, String> qparams,
+                                         String functionAddrStr, String convention) {
+        Program program = resolveProgram(qparams);
+        if (program == null) return jsonError("No program loaded");
+        if (functionAddrStr == null || functionAddrStr.isEmpty()) return jsonError("function_address is required");
+        if (convention == null || convention.isEmpty()) return jsonError("convention is required");
+
+        AtomicBoolean success = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Set calling convention");
+                try {
+                    Address addr = program.getAddressFactory().getAddress(functionAddrStr);
+                    Function func = getFunctionForAddress(program, addr);
+                    if (func != null) {
+                        func.setCallingConvention(convention);
+                        success.set(true);
+                    }
+                } catch (Exception e) {
+                    Msg.error(this, "Error setting calling convention", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return jsonError("Failed: " + e.getMessage());
+        }
+        return success.get() ? jsonOk(jsonString("Calling convention set to '" + convention + "'"))
+                             : jsonError("Failed to set calling convention");
+    }
+
+    // ── END FORK: Utility methods ───────────────────────────────────────────
+
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
 
     @Override
     public void dispose() {
+        // ── FORK: Async executor cleanup ────────────────────────────────────
+        asyncExecutor.shutdownNow();
+        asyncTasks.clear();
+        // ── END FORK ────────────────────────────────────────────────────────
         if (server != null) {
             Msg.info(this, "Stopping GhidraMCP HTTP server...");
             server.stop(1);

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ghidra": {
+      "command": "C:\\Python314\\python.exe",
+      "args": ["C:\\Users\\agust\\Escritorio\\Imperium\\Ghidra\\GhidraMCP\\bridge_mcp_ghidra.py"],
+      "env": {}
+    }
+  }
+}
